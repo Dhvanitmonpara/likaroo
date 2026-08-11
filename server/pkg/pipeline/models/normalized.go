@@ -100,6 +100,11 @@ type NormalizedResult struct {
 	PDFDetails     *PDFDetails     `json:"pdf_details,omitempty"`
 	ImageDetails   *ImageDetails   `json:"image_details,omitempty"`
 
+	// Agentic Processing Outputs
+	Content string   `json:"content,omitempty"`
+	Notes   string   `json:"notes,omitempty"`
+	Tags    []string `json:"tags,omitempty"`
+
 	// Non-fatal processing warnings/errors
 	Errors []ExtractionError `json:"errors,omitempty"`
 }

@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -9,12 +10,53 @@ import (
 
 	"linkaroo-app/server/db"
 	"linkaroo-app/server/models"
+	"linkaroo-app/server/pkg/pipeline"
+	pipelineModels "linkaroo-app/server/pkg/pipeline/models"
 	"linkaroo-app/server/utils"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
+
+func attachTagsToUserLink(userLink *models.UserLink, userID uuid.UUID, tagNames []string) {
+	if len(tagNames) == 0 || userLink == nil {
+		return
+	}
+
+	log.Printf("[Agent Pipeline] Generated tags for link %s (User: %s): %v", userLink.ID, userID, tagNames)
+
+	var tagsToAttach []models.Tag
+	for _, name := range tagNames {
+		cleanName := strings.TrimSpace(strings.ToLower(name))
+		if cleanName == "" {
+			continue
+		}
+
+		var tag models.Tag
+		err := db.DB.Where("tagname = ?", cleanName).First(&tag).Error
+		if err != nil {
+			// Create tag if not exists
+			tag = models.Tag{
+				Tagname: cleanName,
+				OwnerID: &userID,
+			}
+			if createErr := db.DB.Create(&tag).Error; createErr != nil {
+				log.Printf("[Agent Pipeline] Failed to create tag %q: %v", cleanName, createErr)
+				continue
+			}
+		}
+		tagsToAttach = append(tagsToAttach, tag)
+	}
+
+	if len(tagsToAttach) > 0 {
+		if err := db.DB.Model(userLink).Association("Tags").Append(tagsToAttach); err != nil {
+			log.Printf("[Agent Pipeline] Failed to attach tags to UserLink %s: %v", userLink.ID, err)
+		} else {
+			log.Printf("[Agent Pipeline] Successfully attached %d tag(s) to UserLink %s", len(tagsToAttach), userLink.ID)
+		}
+	}
+}
 
 func getOrCreateLink(targetURL, title, description, image, contentType string) (*models.Link, error) {
 	var link models.Link
@@ -135,12 +177,25 @@ func CreateLink(c *gin.Context) {
 
 	ghToken := GetActiveGitHubTokenForUser(req.UserId)
 	gptToken := GetActiveChatGPTTokenForUser(req.UserId)
+
+	// Execute processing pipeline (Metadata Scraping -> Canonical Mapping -> LangChain Agent Workflow)
+	pipe := pipeline.NewPipeline(nil)
+	pipeResult, _ := pipe.Process(c.Request.Context(), pipelineModels.RawItem{
+		URL: req.Link,
+		Headers: map[string]string{
+			"GitHub-Token":  ghToken,
+			"ChatGPT-Token": gptToken,
+		},
+	})
+
 	meta := utils.FetchMetadataWithToken(req.Link, ghToken, gptToken)
 	isReachable := meta.Title != "" || meta.Description != ""
 
 	title := strings.TrimSpace(req.Title)
 	if title == "" || title == req.Link || strings.HasPrefix(title, "http://") || strings.HasPrefix(title, "https://") {
-		if meta.Title != "" {
+		if pipeResult != nil && pipeResult.Title != "" {
+			title = pipeResult.Title
+		} else if meta.Title != "" {
 			title = meta.Title
 		} else {
 			title = utils.GenerateTitleFromURL(req.Link)
@@ -149,7 +204,11 @@ func CreateLink(c *gin.Context) {
 
 	description := req.Description
 	if description == "" {
-		description = meta.Description
+		if pipeResult != nil && pipeResult.Notes != "" {
+			description = pipeResult.Notes
+		} else {
+			description = meta.Description
+		}
 	}
 
 	linkObj, err := getOrCreateLink(req.Link, title, description, meta.Image, utils.DetectContentType(req.Link, meta.Type))
@@ -163,10 +222,16 @@ func CreateLink(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to map link to user"})
 		return
 	}
+
+	// Attach generated tags from pipeline agent workflow to user link
+	if pipeResult != nil && len(pipeResult.Tags) > 0 {
+		attachTagsToUserLink(userLinkObj, userID, pipeResult.Tags)
+	}
+
 	link := *linkObj
 	userLink := *userLinkObj
 
-	db.DB.Preload("Link").First(&userLink, userLink.ID)
+	db.DB.Preload("Link").Preload("Tags").Preload("Tasks").First(&userLink, userLink.ID)
 
 	customLink := gin.H{
 		"title":        title,
@@ -176,6 +241,7 @@ func CreateLink(c *gin.Context) {
 		"image":        meta.Image,
 		"isChecked":    false,
 		"contentType":  link.ContentType,
+		"tags":         userLink.Tags,
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
@@ -259,15 +325,30 @@ func QuickAddLink(c *gin.Context) {
 	var customTitle *string
 	var customDescription *string
 
+	pipe := pipeline.NewPipeline(nil)
+	var rawItem pipelineModels.RawItem
+	if isLink {
+		rawItem = pipelineModels.RawItem{URL: targetURL}
+	} else {
+		rawItem = pipelineModels.RawItem{Text: rawInput}
+	}
+	pipeResult, _ := pipe.Process(c.Request.Context(), rawItem)
+
 	if isLink {
 		ghToken := GetActiveGitHubTokenForUser(req.UserId)
 		gptToken := GetActiveChatGPTTokenForUser(req.UserId)
 		meta := utils.FetchMetadataWithToken(targetURL, ghToken, gptToken)
 		title := meta.Title
+		if title == "" && pipeResult != nil && pipeResult.Title != "" {
+			title = pipeResult.Title
+		}
 		if title == "" {
 			title = utils.GenerateTitleFromURL(targetURL)
 		}
 		description := meta.Description
+		if description == "" && pipeResult != nil && pipeResult.Notes != "" {
+			description = pipeResult.Notes
+		}
 		contentType := utils.DetectContentType(targetURL, meta.Type)
 
 		linkObj, err := getOrCreateLink(targetURL, title, description, meta.Image, contentType)
@@ -282,6 +363,12 @@ func QuickAddLink(c *gin.Context) {
 	} else {
 		defaultTitle := ""
 		noteDesc := rawInput
+		if pipeResult != nil && pipeResult.Title != "" {
+			defaultTitle = pipeResult.Title
+		}
+		if pipeResult != nil && pipeResult.Notes != "" {
+			noteDesc = pipeResult.Notes
+		}
 		customTitle = &defaultTitle
 		customDescription = &noteDesc
 
@@ -302,7 +389,13 @@ func QuickAddLink(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to map link to user"})
 		return
 	}
+
+	if pipeResult != nil && len(pipeResult.Tags) > 0 {
+		attachTagsToUserLink(userLinkObj, userID, pipeResult.Tags)
+	}
+
 	userLink := *userLinkObj
+	db.DB.Preload("Link").Preload("Tags").Preload("Tasks").First(&userLink, userLink.ID)
 
 	c.JSON(http.StatusCreated, gin.H{
 		"data": gin.H{
@@ -344,11 +437,23 @@ func CreateCard(c *gin.Context) {
 		isLink = true
 	}
 
+	pipe := pipeline.NewPipeline(nil)
+	var cardRawItem pipelineModels.RawItem
+	if isLink {
+		cardRawItem = pipelineModels.RawItem{URL: req.Link}
+	} else {
+		cardRawItem = pipelineModels.RawItem{Text: req.Title + " " + req.Description}
+	}
+	pipeResult, _ := pipe.Process(c.Request.Context(), cardRawItem)
+
 	var link models.Link
 	if isLink {
 		ghToken := GetActiveGitHubTokenForUser(req.UserId)
 		meta := utils.FetchMetadataWithToken(req.Link, ghToken)
 		title := req.Title
+		if title == "" && pipeResult != nil && pipeResult.Title != "" {
+			title = pipeResult.Title
+		}
 		if title == "" {
 			title = meta.Title
 		}
@@ -357,6 +462,9 @@ func CreateCard(c *gin.Context) {
 		}
 
 		description := req.Description
+		if description == "" && pipeResult != nil && pipeResult.Notes != "" {
+			description = pipeResult.Notes
+		}
 		if description == "" {
 			description = meta.Description
 		}
@@ -369,9 +477,14 @@ func CreateCard(c *gin.Context) {
 		link = *linkObj
 	} else {
 		// Content based card (note)
+		cardDesc := req.Description
+		if cardDesc == "" && pipeResult != nil && pipeResult.Notes != "" {
+			cardDesc = pipeResult.Notes
+		}
+
 		link = models.Link{
 			Title:       req.Title,
-			Description: req.Description,
+			Description: cardDesc,
 			LinkURL:     uuid.New().String(), // Unique string to satisfy DB constraints
 			ContentType: "note",
 		}
@@ -386,9 +499,13 @@ func CreateCard(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to map link to user"})
 		return
 	}
-	userLink := *userLinkObj
 
-	db.DB.Preload("Link").First(&userLink, userLink.ID)
+	if pipeResult != nil && len(pipeResult.Tags) > 0 {
+		attachTagsToUserLink(userLinkObj, userID, pipeResult.Tags)
+	}
+
+	userLink := *userLinkObj
+	db.DB.Preload("Link").Preload("Tags").Preload("Tasks").First(&userLink, userLink.ID)
 
 	customLink := gin.H{
 		"title":        link.Title,
@@ -398,6 +515,7 @@ func CreateCard(c *gin.Context) {
 		"image":        link.Image,
 		"isChecked":    false,
 		"contentType":  link.ContentType,
+		"tags":         userLink.Tags,
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
